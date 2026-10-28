@@ -1,0 +1,138 @@
+# 值班视图演示用告警规则
+#
+# 设计要点（这部分就是这套东西的"技术含量"）：
+#   1. 按 layer 分层打标签：application / network，供 Alertmanager 做抑制
+#   2. 先算"聚合状态"（recording rule），再基于聚合状态告警，避免表达式里做向量匹配
+#   3. 核心告警是 LINK_BOTH_DOWN —— 大多数团队只有"主链路 down""备链路 down"，
+#      没有"两条同时 down"，而这恰恰是唯一意味着灾难的状态
+
+groups:
+  # ------------------------------------------------------------------
+  # 记录规则：把"故障域"提前算成可直接用的指标
+  # ------------------------------------------------------------------
+  - name: oncall-context
+    interval: 5s
+    rules:
+      # 主备链路同时中断（伪冗余被击穿）→ 1 表示同时中断
+      - record: link_both_down
+        expr: (1 - max(link_state{link="primary"})) * (1 - max(link_state{link="backup"}))
+
+      # 任意一条链路中断 → 1 表示至少一条断
+      - record: link_any_down
+        expr: 1 - min(link_state)
+
+      # 业务是否处于"不可用"（可用性为 0 或连接数为 0）
+      - record: biz_down
+        expr: (business_availability == 0) or on() (business_connections < 1)
+
+  # ------------------------------------------------------------------
+  # 告警规则
+  # ------------------------------------------------------------------
+  - name: oncall-alerts
+    rules:
+      # ---------- 应用层（症状层） ----------
+      - alert: BIZ_UNAVAILABLE
+        expr: business_availability == 0
+        for: 10s
+        labels:
+          severity: critical
+          layer: application
+          domain: 业务可用性
+        annotations:
+          summary: "业务不可用"
+          description: >-
+            可用性指标为 0。注意：这是"症状"，不要在这一层定位根因，
+            先看链路状态、误码和光功率。
+
+      - alert: BIZ_CONNECTIONS_DROPPED
+        expr: business_connections < 1
+        for: 10s
+        labels:
+          severity: critical
+          layer: application
+          domain: 业务可用性
+        annotations:
+          summary: "活跃连接数归零"
+          description: >-
+            连接数是"归零"而不是"超时堆积"：归零说明断点在链路层（连接直接没了），
+            超时堆积才更像应用过载。这是区分"网络断"和"应用挂"的关键判据。
+
+      - alert: BIZ_LATENCY_DEGRADING
+        expr: (business_latency_p90_seconds > 0.5) and (business_availability == 1)
+        for: 30s
+        labels:
+          severity: warning
+          layer: application
+          domain: 业务性能
+        annotations:
+          summary: "P90 响应耗时劣化（P90 = {{ $value | humanize }}s）"
+          description: >-
+            物理层劣化的最早信号往往不是链路 down，而是延迟分位数上升：
+            误码 → 重传 → 尾部延迟变长。
+            绝对值平均看不出来，P90/P99 才看得出来。
+            先看【链路误码速率】和【接收光功率】。
+
+      # ---------- 网络层（病因层） ----------
+      - alert: LINK_DOWN_PRIMARY
+        expr: link_state{link="primary"} == 0
+        for: 10s
+        labels:
+          severity: critical
+          layer: network
+          domain: 链路可用性
+        annotations:
+          summary: "主链路中断"
+          description: "主用链路 down。自动切换可能已触发，但必须验证切换后业务是否真的可用。"
+
+      - alert: LINK_DOWN_BACKUP
+        expr: link_state{link="backup"} == 0
+        for: 10s
+        labels:
+          severity: critical
+          layer: network
+          domain: 链路可用性
+        annotations:
+          summary: "备链路中断"
+          description: "备用链路 down。单条备链路中断本身不致命，但如果主链路也在劣化，冗余即将耗尽。"
+
+      # ★★★ 核心告警：主备同时中断 = 伪冗余被击穿 ★★★
+      - alert: LINK_BOTH_DOWN
+        expr: link_both_down == 1
+        for: 5s
+        labels:
+          severity: critical
+          layer: network
+          domain: 链路可用性
+          priority: P1
+        annotations:
+          summary: "主备链路同时中断（伪冗余被击穿）"
+          description: >-
+            两条链路同时 down。此时自动切换必然无效——切换的前提是存在可用路径。
+            这通常意味着主备走同一物理路由（同一人井/同一管道/同一运营商），
+            单次施工或单点故障即可同时击穿。立即人工介入，往物理层查。
+
+      - alert: LINK_CRC_RISING
+        expr: rate(link_crc_errors_total[1m]) > 5
+        for: 30s
+        labels:
+          severity: warning
+          layer: network
+          domain: 链路质量
+        annotations:
+          summary: "链路误码速率上升（{{ $value | humanize }} 次/秒）"
+          description: >-
+            误码增长说明物理层在劣化（弯折、接触不良、光衰、干扰）。
+            链路状态可能仍显示 up，但已经不可靠。这是比"链路 down"更早的窗口。
+
+      - alert: LINK_OPTICAL_LOW
+        expr: link_optical_rx_dbm < -25
+        for: 30s
+        labels:
+          severity: warning
+          layer: network
+          domain: 链路质量
+        annotations:
+          summary: "接收光功率过低（{{ $value }} dBm）"
+          description: >-
+            光功率下降是光纤宏弯/接头污染的典型表现。
+            配合误码上升，基本可以锁定物理层损伤，直接联系线路方。

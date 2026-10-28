@@ -1,0 +1,41 @@
+# Alertmanager 配置：演示"保留首报、抑制下游刷屏"
+#
+# 核心思路：
+#   网络层（病因）告警存在时，抑制应用层（症状）告警。
+#   值班的人不该被 200 条"应用超时"淹掉，他需要先看到那一条"主备全断"。
+
+route:
+  receiver: default
+  group_by: ["alertname", "layer", "domain"]
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 4h
+
+receivers:
+  - name: default
+
+inhibit_rules:
+  # 1) 网络层严重告警存在 → 抑制全部应用层告警
+  #    效果：网络断了的时候，你看到的不是 200 条应用告警，而是那一条网络告警
+  - source_matchers:
+      - severity="critical"
+      - layer="network"
+    target_matchers:
+      - layer="application"
+    equal: []
+
+  # 2) 主备同时中断 → 抑制单独的"主链路 down""备链路 down"
+  #    效果：这三条其实是同一个根因，只留最有信息量的那一条
+  - source_matchers:
+      - alertname="LINK_BOTH_DOWN"
+    target_matchers:
+      - alertname=~"LINK_DOWN_PRIMARY|LINK_DOWN_BACKUP"
+    equal: []
+
+  # 3) 业务不可用 → 抑制延迟劣化
+  #    效果：业务都挂了，再说"耗时变慢"没有意义
+  - source_matchers:
+      - alertname="BIZ_UNAVAILABLE"
+    target_matchers:
+      - alertname="BIZ_LATENCY_DEGRADING"
+    equal: []

@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>值班视图 · 本地预览（无需 Docker）</title>
+<style>
+  :root {
+    --bg: #111217; --panel: #181b1f; --border: #2a2f37;
+    --text: #d8d9da; --muted: #8b909a;
+    --green: #73bf69; --red: #f2495c; --orange: #ff9830; --blue: #5794f2;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px; background: var(--bg); color: var(--text);
+    font-family: "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; font-weight: 600; }
+  .sub { color: var(--muted); font-size: 12px; margin-bottom: 18px; line-height: 1.6; }
+  .row { display: flex; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+    padding: 12px 14px; flex: 1 1 0; min-width: 150px;
+  }
+  .card .label { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+  .card .value { font-size: 26px; font-weight: 700; line-height: 1.1; }
+  .card.on   { background: rgba(115,191,105,.14); border-color: var(--green); }
+  .card.off  { background: rgba(242,73,92,.16);  border-color: var(--red); }
+  .card.warn { background: rgba(255,152,48,.14); border-color: var(--orange); }
+  .wide { flex: 1 1 340px; }
+  .chart-title { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+  canvas { width: 100%; height: 120px; display: block; }
+  .legend { color: var(--muted); font-size: 11px; margin-top: 6px; }
+  .legend b { font-weight: 600; }
+  .controls { margin: 18px 0 8px; display: flex; gap: 8px; flex-wrap: wrap; }
+  button {
+    background: #23262d; color: var(--text); border: 1px solid var(--border);
+    border-radius: 4px; padding: 8px 14px; font-size: 13px; cursor: pointer;
+    font-family: inherit;
+  }
+  button:hover { background: #2b2f38; }
+  button.danger { border-color: var(--red); color: #ffb3bb; }
+  .note {
+    margin-top: 18px; padding: 12px 14px; border-left: 3px solid var(--blue);
+    background: rgba(87,148,242,.08); color: var(--muted); font-size: 12px; line-height: 1.8;
+  }
+  .err { color: var(--red); font-size: 13px; margin-top: 12px; }
+  code { color: #ffd28a; }
+</style>
+</head>
+<body>
+
+<h1>值班视图 · 本地预览</h1>
+<div class="sub">
+  零依赖版本：只需要 <code>python demo/mock_exporter.py</code> 一个进程，不用 Docker / Grafana。<br>
+  正式版见 <code>grafana/dashboards/oncall-view.json</code>（<code>docker compose up</code> 一键起）。<br>
+  所有数据均为随机模拟，不含任何真实信息。
+</div>
+
+<div class="row">
+  <div class="card" id="c-avail"><div class="label">业务可用性</div><div class="value">—</div></div>
+  <div class="card" id="c-primary"><div class="label">主链路</div><div class="value">—</div></div>
+  <div class="card" id="c-backup"><div class="label">备链路</div><div class="value">—</div></div>
+  <div class="card" id="c-both"><div class="label">主备同时中断（伪冗余）</div><div class="value">—</div></div>
+  <div class="card" id="c-pending"><div class="label">交接待跟进</div><div class="value">—</div></div>
+</div>
+
+<div class="row">
+  <div class="card wide">
+    <div class="chart-title">响应耗时分位数（ms）</div>
+    <canvas id="chart-latency" height="120"></canvas>
+    <div class="legend">
+      <b style="color:#5794f2">P75</b> ·
+      <b style="color:#ff9830">P90</b> ·
+      <b style="color:#f2495c">P99</b>
+    </div>
+  </div>
+  <div class="card wide">
+    <div class="chart-title">活跃连接数</div>
+    <canvas id="chart-conn" height="120"></canvas>
+    <div class="legend"><b style="color:#73bf69">连接数</b>（归零 = 断链，不是应用过载）</div>
+  </div>
+</div>
+
+<div class="controls">
+  <button onclick="setScenario('normal')">正常</button>
+  <button onclick="setScenario('degrade')">① 延迟劣化（链路仍 up）</button>
+  <button class="danger" onclick="setScenario('down')">② 链路中断（主备同时 down）</button>
+  <button onclick="setScenario('recover')">③ 恢复</button>
+</div>
+
+<div class="note">
+  <b>演示剧本：</b>点 ① → 观察 P90/P99 抬头、误码上升，但「主链路 / 备链路」都还是 UP；<br>
+  再点 ② → 连接数归零、主备同时中断变红，这就是那次故障的形状；<br>
+  最后点 ③ → 业务逐步恢复。<br><br>
+  <b>要点：</b>只看应用层指标，你只知道「业务挂了」；
+  把链路状态放进同一屏，你才能看出「断在哪儿」。
+  而「主备同时中断」这个指标，大多数团队根本没有监控。
+</div>
+
+<div class="err" id="err"></div>
+
+<script>
+const API = "http://localhost:9100";
+const MAX_POINTS = 90;
+
+const hist = { p75: [], p90: [], p99: [], conn: [] };
+
+function push(arr, v) {
+  arr.push(v);
+  if (arr.length > MAX_POINTS) arr.shift();
+}
+
+function setScenario(name) {
+  fetch(API + "/control?scenario=" + name).catch(showErr);
+}
+
+function showErr() {
+  document.getElementById("err").textContent =
+    "连不上 " + API + "。请先在另一个终端运行： python demo/mock_exporter.py";
+}
+
+function setCard(id, text, cls) {
+  const el = document.getElementById(id);
+  el.querySelector(".value").textContent = text;
+  el.className = "card " + (cls || "");
+}
+
+function draw(canvas, series) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
+    canvas.width = w * dpr; canvas.height = h * dpr;
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  let max = 0;
+  series.forEach(s => s.data.forEach(v => { if (v > max) max = v; }));
+  if (max <= 0) max = 1;
+  max *= 1.15;
+
+  // 网格
+  ctx.strokeStyle = "rgba(255,255,255,.06)";
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 3; i++) {
+    const y = (h / 3) * i;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+
+  series.forEach(s => {
+    if (s.data.length < 2) return;
+    ctx.strokeStyle = s.color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    s.data.forEach((v, i) => {
+      const x = (i / (MAX_POINTS - 1)) * w;
+      const y = h - (v / max) * (h - 4) - 2;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  });
+}
+
+async function tick() {
+  try {
+    const r = await fetch(API + "/state", { cache: "no-store" });
+    const data = await r.json();
+    const m = data.metrics;
+
+    setCard("c-avail", m.availability >= 1 ? "可用" : "不可用",
+            m.availability >= 1 ? "on" : "off");
+    setCard("c-primary", m.link_primary >= 1 ? "UP" : "DOWN",
+            m.link_primary >= 1 ? "on" : "off");
+    setCard("c-backup", m.link_backup >= 1 ? "UP" : "DOWN",
+            m.link_backup >= 1 ? "on" : "off");
+
+    const both = (1 - m.link_primary) * (1 - m.link_backup);
+    setCard("c-both", both >= 1 ? "同时中断" : "正常", both >= 1 ? "off" : "on");
+
+    const pend = m.pending_items;
+    setCard("c-pending", String(Math.round(pend)),
+            pend >= 7 ? "off" : (pend >= 4 ? "warn" : "on"));
+
+    push(hist.p75, m.p75 * 1000);
+    push(hist.p90, m.p90 * 1000);
+    push(hist.p99, m.p99 * 1000);
+    push(hist.conn, m.connections);
+
+    draw(document.getElementById("chart-latency"), [
+      { data: hist.p75, color: "#5794f2" },
+      { data: hist.p90, color: "#ff9830" },
+      { data: hist.p99, color: "#f2495c" },
+    ]);
+    draw(document.getElementById("chart-conn"), [
+      { data: hist.conn, color: "#73bf69" },
+    ]);
+
+    document.getElementById("err").textContent = "";
+  } catch (e) {
+    showErr();
+  }
+}
+
+tick();
+setInterval(tick, 2000);
+</script>
+</body>
+</html>
