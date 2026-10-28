@@ -1,29 +1,11 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.egg-info/
-.venv/
-venv/
-
-# 编辑器 / 系统
-.vscode/
-.idea/
+# 系统生成的文件
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# 临时文件与日志
-*.log
-*.tmp
+# Office 临时文件
 ~$*
-*.bak
 
-# 本地环境配置（不要把自己真实环境的配置提交上来）
-.env
-*.local
-config.local.*
-
-# 演示运行时产生的数据
-demo/*.db
-demo/*.sqlite3
+# 编辑器
+.vscode/
+.idea/
